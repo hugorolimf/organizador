@@ -1,0 +1,62 @@
+# Organizador: configuração / configuration
+# Copie para ~/.config/organizador/config.toml e mude só o que quiser.
+# Copy to ~/.config/organizador/config.toml and change only what you need.
+# Every key is optional; anything left out keeps the default shown here.
+# Depois de mudar / after editing:  systemctl --user restart organizador
+
+# Pastas / folders ("~" and $VARS are expanded)
+source = "~/Downloads"
+destination = "~/Documents"
+keep_folder = "Manter"            # subfolder of source that is created and never touched ("" = don't create)
+
+# Modelo local / local model (Ollama)
+ollama_url = "http://localhost:11434/api/chat"
+model = "qwen3.5:4b"
+keep_alive = "45s"                # how long the model stays in (V)RAM after the last file
+max_text = 6000                   # characters of each document sent to the model
+
+# Zips, imagens, vídeos, instaladores esperam antes de sair de Downloads
+# Non-document files wait this long in Downloads before being moved
+wait_others_minutes = 30
+
+# Idiomas do OCR (tesseract) / OCR languages, e.g. "eng", "deu+eng"
+ocr_languages = "por+eng"
+
+# Pedido ao modelo / prompt. Empty = the built-in Portuguese prompt.
+# {categories}, {filename} and {text} are filled in. The model must answer the
+# fields categoria, data (YYYY-MM-DD), emissor (issuer) and titulo (title).
+# See config.en.toml for an English prompt.
+prompt = ""
+
+# Categorias de documentos: pasta = descrição para o modelo.
+# Document categories: folder name = description the model reads.
+# If you set this table, it replaces the whole default list.
+[categories]
+"Editais" = "edital, termo de referência, anexo de licitação, ata de pregão, esclarecimento, impugnação"
+"Atestados" = "atestado de capacidade técnica, CAT, certidão de acervo técnico"
+"Propostas" = "proposta comercial, orçamento, cotação, planilha de preços"
+"Contratos" = "contrato, aditivo, termo aditivo, procuração, acordo, distrato"
+"Certidões" = "certidão negativa, CND, FGTS, certidão trabalhista, regularidade fiscal"
+"Financeiro" = "nota fiscal, boleto, comprovante de pagamento, recibo, extrato, fatura"
+"Documentos Pessoais" = "RG, CPF, CNH, comprovante de residência, documentos pessoais"
+"Empresa" = "contrato social, cartão CNPJ, alvará, estatuto, documentos societários"
+"Relatórios" = "relatório, apresentação, ata de reunião, planejamento"
+"Manuais" = "manual, documentação técnica, guia, tutorial, especificação"
+"Estudos" = "artigo, livro, apostila, material de estudo, pesquisa"
+"Outros documentos" = "qualquer documento que não se encaixe nas outras categorias"
+
+# Pastas por tipo de arquivo (sem IA) / folders by file type (no AI involved)
+[folders]
+images = "Imagens"
+videos = "Vídeos"
+audio = "Áudio"
+archives = "Compactados"
+installers = "Instaladores"
+other_documents = "Outros documentos"   # a document the model could not place
+other_files = "Outros"                  # any other kind of file
+
+# Textos das notificações / notification texts
+[messages]
+undo_button = "Desfazer"
+undone_title = "Desfeito"
+undone_body = "{name} voltou para {folder}"

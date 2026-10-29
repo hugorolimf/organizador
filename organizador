@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""Organizador de Downloads com IA local (Ollama, sob demanda).
+
+Cada arquivo que termina de chegar em ~/Downloads é lido, classificado por um
+modelo local e movido para ~/Documents/<Categoria>/<Ano>/ com um nome legível.
+Arquivos que não são documentos vão por tipo, sem acionar o modelo, e só
+depois de ESPERA_OUTROS (dá tempo de usar um zip ou uma imagem recém-baixada).
+Subpastas de ~/Downloads (ex.: ~/Downloads/Manter) nunca são tocadas.
+Nada é apagado; todo movimento fica no log e pode ser desfeito.
+Pastas, categorias, modelo e textos: ~/.config/organizador/config.toml.
+
+Uso / usage:
+  organizador vigiar            # vigia ~/Downloads (é o que o serviço roda)  [watch]
+  organizador arquivo <caminho> # organiza um arquivo agora                  [file <path>]
+  organizador desfazer          # devolve o último arquivo movido            [undo]
+  organizador log [n]           # mostra os últimos movimentos               [log [n]]
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG = Path(os.environ.get("ORGANIZADOR_CONFIG")
+              or Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "organizador/config.toml")
+ESTADO = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "organizador"
+LOG = ESTADO / "movimentos.jsonl"
+
+# ---------- configuração ----------
+# Valores padrão (em português). Qualquer um pode ser trocado no config.toml;
+# [categories] e [folders] do arquivo substituem os daqui.
+
+PADRAO = {
+    "source": "~/Downloads",
+    "destination": "~/Documents",
+    "keep_folder": "Manter",       # subpasta de source criada e nunca tocada ("" = não criar)
+    "ollama_url": "http://localhost:11434/api/chat",
+    "model": "qwen3.5:4b",
+    "keep_alive": "45s",           # descarrega da VRAM logo depois do último arquivo
+    "max_text": 6000,
+    "wait_others_minutes": 30,     # minutos que zips, imagens, instaladores ficam em Downloads
+    "ocr_languages": "por+eng",
+    "prompt": "",                  # vazio = PROMPT abaixo
+    "categories": {
+        "Editais": "edital, termo de referência, anexo de licitação, ata de pregão, esclarecimento, impugnação",
+        "Atestados": "atestado de capacidade técnica, CAT, certidão de acervo técnico",
+        "Propostas": "proposta comercial, orçamento, cotação, planilha de preços",
+        "Contratos": "contrato, aditivo, termo aditivo, procuração, acordo, distrato",
+        "Certidões": "certidão negativa, CND, FGTS, certidão trabalhista, regularidade fiscal",
+        "Financeiro": "nota fiscal, boleto, comprovante de pagamento, recibo, extrato, fatura",
+        "Documentos Pessoais": "RG, CPF, CNH, comprovante de residência, documentos pessoais",
+        "Empresa": "contrato social, cartão CNPJ, alvará, estatuto, documentos societários",
+        "Relatórios": "relatório, apresentação, ata de reunião, planejamento",
+        "Manuais": "manual, documentação técnica, guia, tutorial, especificação",
+        "Estudos": "artigo, livro, apostila, material de estudo, pesquisa",
+        "Outros documentos": "qualquer documento que não se encaixe nas outras categorias",
+    },
+    "folders": {
+        "images": "Imagens",
+        "videos": "Vídeos",
+        "audio": "Áudio",
+        "archives": "Compactados",
+        "installers": "Instaladores",
+        "other_documents": "Outros documentos",  # documento que o modelo não soube classificar
+        "other_files": "Outros",                 # qualquer outro tipo de arquivo
+    },
+    "messages": {
+        "undo_button": "Desfazer",
+        "undone_title": "Desfeito",
+        "undone_body": "{name} voltou para {folder}",
+    },
+}
+
+
+def _carregar_config():
+    cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in PADRAO.items()}
+    if CONFIG.is_file():
+        try:
+            with CONFIG.open("rb") as f:
+                usuario = tomllib.load(f)
+        except (tomllib.TOMLDecodeError, OSError) as e:
+            sys.exit(f"organizador: erro em {CONFIG}: {e}")
+        for k, v in usuario.items():
+            if k in ("folders", "messages") and isinstance(v, dict):
+                cfg[k].update(v)        # só o que mudou
+            else:
+                cfg[k] = v              # categories: a lista inteira
+    return cfg
+
+
+def _caminho(s):
+    return Path(os.path.expandvars(os.path.expanduser(str(s))))
+
+
+CFG = _carregar_config()
+ORIGEM = _caminho(CFG["source"])
+DESTINO = _caminho(CFG["destination"])
+MANTER = CFG["keep_folder"]
+
+OLLAMA = CFG["ollama_url"]
+MODELO = CFG["model"]
+KEEP_ALIVE = CFG["keep_alive"]
+MAX_TEXTO = int(CFG["max_text"])
+ESPERA_OUTROS = float(CFG["wait_others_minutes"]) * 60
+OCR_IDIOMAS = CFG["ocr_languages"]
+
+CATEGORIAS = dict(CFG["categories"])
+PASTAS = CFG["folders"]
+TEXTOS = CFG["messages"]
+OUTROS_DOCUMENTOS = PASTAS["other_documents"]
+OUTROS = PASTAS["other_files"]
+
+EXTENSOES = {
+    "images": {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".heic", ".bmp", ".tiff"},
+    "videos": {".mp4", ".mkv", ".mov", ".webm", ".avi"},
+    "audio": {".mp3", ".wav", ".ogg", ".opus", ".m4a", ".flac"},
+    "archives": {".zip", ".rar", ".7z", ".tar", ".gz", ".xz", ".zst", ".bz2"},
+    "installers": {".appimage", ".deb", ".rpm", ".exe", ".msi", ".pkg", ".flatpakref", ".iso"},
+}
+IMAGENS = EXTENSOES["images"]
+POR_EXTENSAO = {}   # pasta -> extensões (duas pastas com o mesmo nome se juntam)
+for _tipo, _exts in EXTENSOES.items():
+    POR_EXTENSAO.setdefault(PASTAS[_tipo], set()).update(_exts)
+DOCUMENTOS = {".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".md", ".xlsx", ".xls",
+              ".ods", ".csv", ".pptx", ".odp", ".xml", ".html"}
+TEMPORARIOS = {".part", ".crdownload", ".tmp", ".download", ".partial", ".opdownload"}
+
+
+# ---------- extração de texto ----------
+
+def _rodar(cmd, timeout=120):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def _ocr(imagem):
+    return _rodar(["tesseract", str(imagem), "-", "-l", OCR_IDIOMAS])
+
+
+def _texto_pdf(caminho):
+    texto = _rodar(["pdftotext", "-l", "3", "-layout", str(caminho), "-"])
+    if len(texto.strip()) >= 200:
+        return texto
+    # PDF escaneado: OCR das duas primeiras páginas.
+    with tempfile.TemporaryDirectory() as tmp:
+        _rodar(["pdftoppm", "-r", "200", "-l", "2", "-png", str(caminho), f"{tmp}/p"])
+        return "\n".join(_ocr(p) for p in sorted(Path(tmp).glob("p*.png")))
+
+
+def _texto_office(caminho):
+    partes = {".docx": "word/document.xml", ".odt": "content.xml", ".ods": "content.xml",
+              ".odp": "content.xml", ".xlsx": "xl/sharedStrings.xml", ".pptx": "ppt/slides/*.xml"}
+    xml = _rodar(["unzip", "-p", str(caminho), partes[caminho.suffix.lower()]])
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", xml))
+
+
+def extrair_texto(caminho):
+    ext = caminho.suffix.lower()
+    if ext == ".pdf":
+        return _texto_pdf(caminho)
+    if ext in {".docx", ".odt", ".ods", ".odp", ".xlsx", ".pptx"}:
+        return _texto_office(caminho)
+    if ext in {".txt", ".md", ".csv", ".xml", ".html", ".rtf"}:
+        return caminho.read_text(errors="ignore")[:MAX_TEXTO * 2]
+    if ext in IMAGENS:
+        return _ocr(caminho)
+    return ""
+
+
+# ---------- modelo local ----------
+
+ESQUEMA = {
+    "type": "object",
+    "properties": {
+        "categoria": {"type": "string", "enum": list(CATEGORIAS)},
+        "data": {"type": "string", "description": "AAAA-MM-DD ou vazio"},
+        "emissor": {"type": "string"},
+        "titulo": {"type": "string"},
+    },
+    "required": ["categoria", "data", "emissor", "titulo"],
+}
+
+
+# Modelo do pedido. {categories}, {filename} e {text} são trocados pela lista
+# de categorias, pelo nome original e pelo texto extraído. Os campos da
+# resposta (categoria, data, emissor, titulo) são fixos: o ESQUEMA os exige.
+PROMPT = """Classifique este documento brasileiro para arquivá-lo.
+
+Categorias:
+{categories}
+
+Responda em JSON com:
+- categoria: uma das categorias acima
+- data: a data principal do documento (emissão, sessão da licitação ou vencimento) em AAAA-MM-DD; vazio se não houver
+- emissor: quem emitiu, curto (ex.: "Pref. Recife", "Banco do Brasil", "Receita Federal"); vazio se não souber
+- titulo: descrição curta e específica, até 8 palavras, sem repetir o emissor nem a data (ex.: "Pregão 045-2026 Pavimentação", "NF 1234 Serviços de TI")
+
+Nome original do arquivo: {filename}
+
+Texto do documento:
+{text}"""
+
+
+def classificar(nome_original, texto):
+    lista = "\n".join(f"- {c}: {d}" for c, d in CATEGORIAS.items())
+    valores = {"categories": lista, "filename": nome_original, "text": texto[:MAX_TEXTO]}
+    prompt = re.sub(r"\{(categories|filename|text)\}", lambda m: valores[m.group(1)], CFG["prompt"] or PROMPT)
+    corpo = json.dumps({
+        "model": MODELO, "stream": False, "think": False, "keep_alive": KEEP_ALIVE,
+        "format": ESQUEMA, "options": {"temperature": 0, "num_ctx": 8192},
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(OLLAMA, corpo, {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return json.loads(json.loads(r.read())["message"]["content"])
+
+
+# ---------- mover, registrar, desfazer ----------
+
+def _limpo(s, limite):
+    s = re.sub(r'[\\/:*?"<>|\n\r\t]+', " ", s or "")
+    return re.sub(r"\s+", " ", s).strip(" .-–")[:limite]
+
+
+def _livre(alvo):
+    n = 2
+    base, ext = alvo.with_suffix(""), alvo.suffix
+    while alvo.exists():
+        alvo = Path(f"{base} ({n}){ext}")
+        n += 1
+    return alvo
+
+
+def _registrar(origem, destino, categoria):
+    ESTADO.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(json.dumps({"quando": datetime.now().isoformat(timespec="seconds"),
+                            "de": str(origem), "para": str(destino),
+                            "categoria": categoria}, ensure_ascii=False) + "\n")
+
+
+def _notificar(titulo, corpo, origem, destino):
+    """Notificação com botão Desfazer; espera o clique numa thread à parte."""
+    def esperar():
+        r = _rodar(["notify-send", "-a", "Organizador", "-i", "folder-documents",
+                    "-t", "20000", "-A", f"desfazer={TEXTOS['undo_button']}", titulo, corpo], timeout=60)
+        if r.strip() == "desfazer":
+            desfazer(destino, origem)
+    threading.Thread(target=esperar, daemon=True).start()
+
+
+def desfazer(destino=None, origem=None):
+    if destino is None:
+        linhas = LOG.read_text().splitlines() if LOG.exists() else []
+        if not linhas:
+            print("Nada para desfazer.")
+            return
+        ultimo = json.loads(linhas[-1])
+        destino, origem = Path(ultimo["para"]), Path(ultimo["de"])
+    if not destino.exists():
+        print(f"Não encontrei {destino}.")
+        return
+    volta = _livre(origem)
+    shutil.move(str(destino), str(volta))
+    _registrar(destino, volta, "desfeito")
+    corpo = TEXTOS["undone_body"].replace("{name}", volta.name).replace("{folder}", volta.parent.name)
+    _rodar(["notify-send", "-a", "Organizador", "-t", "5000", TEXTOS["undone_title"], corpo])
+    print(f"Desfeito: {volta}")
+
+
+def organizar(caminho):
+    caminho = Path(caminho)
+    if not caminho.is_file():
+        return
+    ext = caminho.suffix.lower()
+    ano = str(datetime.fromtimestamp(caminho.stat().st_mtime).year)
+
+    categoria = next((c for c, exts in POR_EXTENSAO.items() if ext in exts), None)
+    nome = caminho.name
+    texto = ""
+    if ext in DOCUMENTOS or ext in IMAGENS:
+        texto = extrair_texto(caminho)
+    # Imagens só viram documento quando têm texto de verdade (prints, scans).
+    if texto.strip() and (ext in DOCUMENTOS or len(texto.strip()) > 300):
+        try:
+            info = classificar(caminho.name, texto)
+        except Exception as e:  # Ollama fora do ar: deixa o arquivo onde está
+            print(f"Modelo indisponível ({e}); {caminho.name} ficou em {ORIGEM.name}.", file=sys.stderr)
+            return
+        categoria = info.get("categoria") if info.get("categoria") in CATEGORIAS else OUTROS_DOCUMENTOS
+        data = info.get("data", "")
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", data or ""):
+            ano = data[:4]
+        else:
+            data = datetime.fromtimestamp(caminho.stat().st_mtime).strftime("%Y-%m-%d")
+        partes = [data, _limpo(info.get("titulo"), 70), _limpo(info.get("emissor"), 40)]
+        nome = " – ".join(p for p in partes if p) + ext
+    elif categoria is None:
+        categoria = OUTROS_DOCUMENTOS if ext in DOCUMENTOS else OUTROS
+
+    destino = _livre(DESTINO / categoria / ano / nome)
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(caminho), str(destino))
+    _registrar(caminho, destino, categoria)
+    _notificar(nome, f"→ {DESTINO.name}/{categoria}/{ano}", caminho, destino)
+    print(f"{caminho.name} → {destino}")
+    return destino
+
+
+# ---------- vigia ----------
+
+def _ignorar(p):
+    return (p.name.startswith(".") or p.suffix.lower() in TEMPORARIOS
+            or p.parent != ORIGEM or not p.is_file())
+
+
+def _estavel(p, espera=2.0):
+    """Espera o tamanho parar de mudar (download ainda sendo gravado)."""
+    try:
+        antes = -1
+        while (agora := p.stat().st_size) != antes:
+            antes = agora
+            time.sleep(espera)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+_fila = threading.Lock()     # um arquivo por vez: o modelo não carrega duas vezes
+
+
+def _organizar_seguro(p):
+    if _ignorar(p):          # já saiu de Downloads, foi para uma subpasta ou apagado
+        return
+    with _fila:
+        try:
+            organizar(p)
+        except Exception as e:
+            print(f"Erro em {p.name}: {e}", file=sys.stderr)
+
+
+def _agendar(p):
+    """Documentos na hora; o resto só depois de ESPERA_OUTROS desde que chegou."""
+    if p.suffix.lower() in DOCUMENTOS:
+        _organizar_seguro(p)
+        return
+    falta = ESPERA_OUTROS - (time.time() - p.stat().st_mtime)
+    t = threading.Timer(max(0, falta), _organizar_seguro, [p])
+    t.daemon = True
+    t.start()
+
+
+def vigiar():
+    ORIGEM.mkdir(exist_ok=True)
+    if MANTER:
+        (ORIGEM / MANTER).mkdir(exist_ok=True)
+    proc = subprocess.Popen(["inotifywait", "-m", "-q", "-e", "close_write", "-e", "moved_to",
+                             "--format", "%w%f", str(ORIGEM)], stdout=subprocess.PIPE, text=True)
+    # Retoma o que ficou em Downloads enquanto o serviço estava parado.
+    for p in sorted(ORIGEM.iterdir()):
+        if not _ignorar(p):
+            _agendar(p)
+    vistos = {}
+    for linha in proc.stdout:
+        p = Path(linha.rstrip("\n"))
+        if _ignorar(p) or time.time() - vistos.get(p, 0) < 10:
+            continue
+        vistos[p] = time.time()
+        if _estavel(p) and p.exists():
+            _agendar(p)
+
+
+APELIDOS = {"watch": "vigiar", "file": "arquivo", "undo": "desfazer"}   # comandos em inglês
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "vigiar"
+    cmd = APELIDOS.get(cmd, cmd)
+    if cmd == "vigiar":
+        vigiar()
+    elif cmd == "arquivo" and len(sys.argv) > 2:
+        organizar(sys.argv[2])
+        time.sleep(0.5)
+    elif cmd == "desfazer":
+        desfazer()
+    elif cmd == "log":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+        for l in (LOG.read_text().splitlines() if LOG.exists() else [])[-n:]:
+            m = json.loads(l)
+            print(f'{m["quando"]}  {Path(m["de"]).name}  →  {m["para"]}')
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

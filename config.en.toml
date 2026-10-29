@@ -1,0 +1,50 @@
+# Organizador in English. Copy to ~/.config/organizador/config.toml, adjust,
+# then: systemctl --user restart organizador
+# Keys left out keep their (Portuguese) defaults; see config.example.toml.
+
+source = "~/Downloads"
+destination = "~/Documents"
+keep_folder = "Keep"
+
+model = "qwen3.5:4b"
+ocr_languages = "eng"
+
+prompt = """Classify this document so it can be filed.
+
+Categories:
+{categories}
+
+Answer in JSON with:
+- categoria: one of the categories above, exactly as written
+- data: the document's main date (issue date, due date or meeting date) as YYYY-MM-DD; empty if there is none
+- emissor: who issued it, short (e.g. "City of Austin", "Chase Bank", "IRS"); empty if unknown
+- titulo: a short, specific description, up to 8 words, not repeating the issuer or the date (e.g. "Invoice 1234 IT services", "Lease renewal")
+
+Original file name: {filename}
+
+Document text:
+{text}"""
+
+[categories]
+"Finance" = "invoice, receipt, bill, bank statement, payment confirmation, tax form"
+"Contracts" = "contract, agreement, lease, amendment, power of attorney, NDA"
+"Personal" = "ID card, passport, driver's license, proof of address, certificates, personal records"
+"Work" = "proposal, quote, report, presentation, meeting minutes, plan"
+"Health" = "medical report, prescription, lab results, health insurance"
+"Manuals" = "manual, technical documentation, guide, tutorial, specification, datasheet"
+"Study" = "paper, book, course material, research, notes"
+"Other documents" = "any document that fits none of the other categories"
+
+[folders]
+images = "Images"
+videos = "Videos"
+audio = "Audio"
+archives = "Archives"
+installers = "Installers"
+other_documents = "Other documents"
+other_files = "Other"
+
+[messages]
+undo_button = "Undo"
+undone_title = "Undone"
+undone_body = "{name} is back in {folder}"

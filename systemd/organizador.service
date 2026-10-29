@@ -1,0 +1,13 @@
+[Unit]
+Description=Organizador de Downloads com IA local
+After=graphical-session.target ollama.service
+
+[Service]
+ExecStart=%h/.local/bin/organizador vigiar
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target
