@@ -5,7 +5,6 @@
 **Your Downloads folder, filed by a local AI.**
 Every document you download is read, named and put in its folder, on your own machine.
 
-![demo](assets/demo.gif)
 
 </div>
 
