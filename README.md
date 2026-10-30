@@ -5,6 +5,7 @@
 **Your Downloads folder, filed by a local AI.**
 Every document you download is read, named and put in its folder, on your own machine.
 
+![Two documents dropped in Downloads, read by the local model and filed under readable names](assets/demo.gif)
 
 </div>
 
